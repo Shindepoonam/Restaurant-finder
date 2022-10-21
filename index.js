@@ -1,133 +1,129 @@
-/*!
- * basic-auth
- * Copyright(c) 2013 TJ Holowaychuk
- * Copyright(c) 2014 Jonathan Ong
- * Copyright(c) 2015-2016 Douglas Christopher Wilson
- * MIT Licensed
- */
+//binary data writer tuned for creating
+//postgres message packets as effeciently as possible by reusing the
+//same buffer to avoid memcpy and limit memory allocations
+var Writer = module.exports = function (size) {
+  this.size = size || 1024;
+  this.buffer = Buffer.alloc(this.size + 5);
+  this.offset = 5;
+  this.headerPosition = 0;
+};
 
-'use strict'
-
-/**
- * Module dependencies.
- * @private
- */
-
-var Buffer = require('safe-buffer').Buffer
-
-/**
- * Module exports.
- * @public
- */
-
-module.exports = auth
-module.exports.parse = parse
-
-/**
- * RegExp for basic auth credentials
- *
- * credentials = auth-scheme 1*SP token68
- * auth-scheme = "Basic" ; case insensitive
- * token68     = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
- * @private
- */
-
-var CREDENTIALS_REGEXP = /^ *(?:[Bb][Aa][Ss][Ii][Cc]) +([A-Za-z0-9._~+/-]+=*) *$/
-
-/**
- * RegExp for basic auth user/pass
- *
- * user-pass   = userid ":" password
- * userid      = *<TEXT excluding ":">
- * password    = *TEXT
- * @private
- */
-
-var USER_PASS_REGEXP = /^([^:]*):(.*)$/
-
-/**
- * Parse the Authorization header field of a request.
- *
- * @param {object} req
- * @return {object} with .name and .pass
- * @public
- */
-
-function auth (req) {
-  if (!req) {
-    throw new TypeError('argument req is required')
+//resizes internal buffer if not enough size left
+Writer.prototype._ensure = function (size) {
+  var remaining = this.buffer.length - this.offset;
+  if (remaining < size) {
+    var oldBuffer = this.buffer;
+    // exponential growth factor of around ~ 1.5
+    // https://stackoverflow.com/questions/2269063/buffer-growth-strategy
+    var newSize = oldBuffer.length + (oldBuffer.length >> 1) + size;
+    this.buffer = Buffer.alloc(newSize);
+    oldBuffer.copy(this.buffer);
   }
+};
 
-  if (typeof req !== 'object') {
-    throw new TypeError('argument req is required to be an object')
-  }
+Writer.prototype.addInt32 = function (num) {
+  this._ensure(4);
+  this.buffer[this.offset++] = (num >>> 24 & 0xFF);
+  this.buffer[this.offset++] = (num >>> 16 & 0xFF);
+  this.buffer[this.offset++] = (num >>> 8 & 0xFF);
+  this.buffer[this.offset++] = (num >>> 0 & 0xFF);
+  return this;
+};
 
-  // get header
-  var header = getAuthorization(req)
+Writer.prototype.addInt16 = function (num) {
+  this._ensure(2);
+  this.buffer[this.offset++] = (num >>> 8 & 0xFF);
+  this.buffer[this.offset++] = (num >>> 0 & 0xFF);
+  return this;
+};
 
-  // parse header
-  return parse(header)
+//for versions of node requiring 'length' as 3rd argument to buffer.write
+var writeString = function (buffer, string, offset, len) {
+  buffer.write(string, offset, len);
+};
+
+//overwrite function for older versions of node
+if (Buffer.prototype.write.length === 3) {
+  writeString = function (buffer, string, offset, len) {
+    buffer.write(string, offset);
+  };
 }
 
-/**
- * Decode base64 string.
- * @private
- */
-
-function decodeBase64 (str) {
-  return Buffer.from(str, 'base64').toString()
-}
-
-/**
- * Get the Authorization header from request object.
- * @private
- */
-
-function getAuthorization (req) {
-  if (!req.headers || typeof req.headers !== 'object') {
-    throw new TypeError('argument req is required to have headers property')
+Writer.prototype.addCString = function (string) {
+  //just write a 0 for empty or null strings
+  if (!string) {
+    this._ensure(1);
+  } else {
+    var len = Buffer.byteLength(string);
+    this._ensure(len + 1); //+1 for null terminator
+    writeString(this.buffer, string, this.offset, len);
+    this.offset += len;
   }
 
-  return req.headers.authorization
-}
+  this.buffer[this.offset++] = 0; // null terminator
+  return this;
+};
 
-/**
- * Parse basic auth to object.
- *
- * @param {string} string
- * @return {object}
- * @public
- */
+Writer.prototype.addChar = function (c) {
+  this._ensure(1);
+  writeString(this.buffer, c, this.offset, 1);
+  this.offset++;
+  return this;
+};
 
-function parse (string) {
-  if (typeof string !== 'string') {
-    return undefined
+Writer.prototype.addString = function (string) {
+  string = string || "";
+  var len = Buffer.byteLength(string);
+  this._ensure(len);
+  this.buffer.write(string, this.offset);
+  this.offset += len;
+  return this;
+};
+
+Writer.prototype.getByteLength = function () {
+  return this.offset - 5;
+};
+
+Writer.prototype.add = function (otherBuffer) {
+  this._ensure(otherBuffer.length);
+  otherBuffer.copy(this.buffer, this.offset);
+  this.offset += otherBuffer.length;
+  return this;
+};
+
+Writer.prototype.clear = function () {
+  this.offset = 5;
+  this.headerPosition = 0;
+  this.lastEnd = 0;
+};
+
+//appends a header block to all the written data since the last
+//subsequent header or to the beginning if there is only one data block
+Writer.prototype.addHeader = function (code, last) {
+  var origOffset = this.offset;
+  this.offset = this.headerPosition;
+  this.buffer[this.offset++] = code;
+  //length is everything in this packet minus the code
+  this.addInt32(origOffset - (this.headerPosition + 1));
+  //set next header position
+  this.headerPosition = origOffset;
+  //make space for next header
+  this.offset = origOffset;
+  if (!last) {
+    this._ensure(5);
+    this.offset += 5;
   }
+};
 
-  // parse header
-  var match = CREDENTIALS_REGEXP.exec(string)
-
-  if (!match) {
-    return undefined
+Writer.prototype.join = function (code) {
+  if (code) {
+    this.addHeader(code, true);
   }
+  return this.buffer.slice(code ? 0 : 5, this.offset);
+};
 
-  // decode user pass
-  var userPass = USER_PASS_REGEXP.exec(decodeBase64(match[1]))
-
-  if (!userPass) {
-    return undefined
-  }
-
-  // return credentials object
-  return new Credentials(userPass[1], userPass[2])
-}
-
-/**
- * Object to represent user credentials.
- * @private
- */
-
-function Credentials (name, pass) {
-  this.name = name
-  this.pass = pass
-}
+Writer.prototype.flush = function (code) {
+  var result = this.join(code);
+  this.clear();
+  return result;
+};
